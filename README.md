@@ -1,5 +1,5 @@
 # Throttle
-Created by Web Manager
+Linux限速工具，支持安装了Alpine/Debian的ARM和X86设备
 
 # 安装命令
 ```bash
