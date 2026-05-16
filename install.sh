@@ -13,7 +13,6 @@ BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 info()  { printf "\033[1;32m[INFO]\033[0m  %s\n" "$1"; }
 error() { printf "\033[1;31m[ERROR]\033[0m %s\n" "$1"; exit 1; }
 
-# ========== 权限检查（POSIX 兼容） ==========
 [ "$(id -u)" -ne 0 ] && error "请用 root 运行: wget -O- URL | sh"
 
 # ========== 架构检测 ==========
@@ -25,7 +24,7 @@ case "$ARCH" in
 esac
 info "架构: ${ARCH} → ${FILE}"
 
-# ========== 创建目录并下载 ==========
+# ========== 下载 ==========
 mkdir -p "${INSTALL_DIR}"
 
 URL="${BASE_URL}/${FILE}"
@@ -46,7 +45,7 @@ if [ -z "$DEFAULT_IFACE" ]; then
     DEFAULT_IFACE="eth0"
 fi
 
-# ========== 交互式配置（从 /dev/tty 读取，兼容管道执行） ==========
+# ========== 交互式配置 ==========
 echo ""
 echo "========================================="
 echo "        网络限速配置"
