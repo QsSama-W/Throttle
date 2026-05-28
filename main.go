@@ -62,11 +62,11 @@ var defaultConfig = AppConfig{
 var reader = bufio.NewReader(os.Stdin)
 
 const (
-	logPrefix     = "THROTTLE_IN"
 	retentionDays = 10
 	logFilePath   = "/var/log/throttle-inbound.log"
 	stateDir      = "/var/lib/throttle"
 	stateFile     = "/var/lib/throttle/lastseen"
+	markerFile    = "/var/lib/throttle/.installed"
 )
 
 // ========== 路径 ==========
@@ -159,6 +159,71 @@ func readInput(prompt string, defaultVal string) string {
 	return input
 }
 
+// ========== 覆盖安装检测 ==========
+
+func promptExistingConfig() {
+	cfg := loadConfig()
+	fmt.Println("\n检测到已有配置:")
+	for _, dev := range cfg.Devices {
+		burst := calcBurst(dev)
+		if dev.BurstKB > 0 {
+			fmt.Printf("  网卡: %-10s 限速: %d Mbps 突发: %d KB\n", dev.Interface, dev.LimitMbps, burst)
+		} else {
+			fmt.Printf("  网卡: %-10s 限速: %d Mbps 突发: 自动\n", dev.Interface, dev.LimitMbps)
+		}
+	}
+	fmt.Print("\n使用现有配置？(Y/n): ")
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(strings.ToLower(input))
+	if input == "n" || input == "no" {
+		doSetup()
+	} else {
+		fmt.Println("\n✓ 使用现有配置")
+	}
+}
+
+func checkUpgrade() {
+	configPath := getConfigPath()
+	_, configErr := os.Stat(configPath)
+
+	if os.IsNotExist(configErr) {
+		// 首次安装，无配置
+		fmt.Println("\n首次运行，请配置限速参数。")
+		doSetup()
+		os.MkdirAll(stateDir, 0755)
+		os.WriteFile(markerFile, []byte(time.Now().Format(time.RFC3339)), 0644)
+		return
+	}
+
+	// 配置存在，检查是否升级
+	_, markerErr := os.Stat(markerFile)
+	if os.IsNotExist(markerErr) {
+		// 有配置但无标记文件（旧版本安装 / 首次使用新版本）
+		promptExistingConfig()
+		os.MkdirAll(stateDir, 0755)
+		os.WriteFile(markerFile, []byte(time.Now().Format(time.RFC3339)), 0644)
+		return
+	}
+
+	// 标记文件存在，对比二进制修改时间
+	exe, exeErr := os.Executable()
+	if exeErr != nil {
+		return
+	}
+	exeInfo, err := os.Stat(exe)
+	if err != nil {
+		return
+	}
+	markerInfo, err := os.Stat(markerFile)
+	if err != nil {
+		return
+	}
+	if exeInfo.ModTime().After(markerInfo.ModTime()) {
+		promptExistingConfig()
+		os.WriteFile(markerFile, []byte(time.Now().Format(time.RFC3339)), 0644)
+	}
+}
+
 // ========== 功能：限速 ==========
 
 func doApply(cfg AppConfig) {
@@ -233,7 +298,7 @@ func doInterfaces() {
 // ========== 功能：配置 ==========
 
 func doSetup() {
-	fmt.Println("\n========== 重新配置 ==========")
+	fmt.Println("\n========== 重新配置 ==========\n")
 	defaultIface := "eth0"
 	if data, err := exec.Command("sh", "-c", "ip route | awk '/^default/{print $5; exit}'").Output(); err == nil {
 		if s := strings.TrimSpace(string(data)); s != "" {
@@ -268,6 +333,22 @@ func detectInit() string {
 		return "sysv"
 	}
 	return "unknown"
+}
+
+func isAutostartEnabled() bool {
+	init := detectInit()
+	switch init {
+	case "systemd":
+		out := runCmdOutput("systemctl is-enabled throttle.service 2>/dev/null")
+		return strings.TrimSpace(out) == "enabled"
+	case "openrc":
+		out := runCmdOutput("rc-update show default 2>/dev/null")
+		return strings.Contains(out, "throttle")
+	case "sysv":
+		out := runCmdOutput("ls /etc/rc2.d/S*throttle /etc/rc3.d/S*throttle 2>/dev/null")
+		return strings.TrimSpace(out) != ""
+	}
+	return false
 }
 
 func doEnable() {
@@ -393,11 +474,9 @@ func parseHexPort(hexPort string) string {
 	return strconv.Itoa(int(n))
 }
 
-// readProcTCP 从 /proc/net/tcp 和 tcp6 读取入站 TCP 连接
 func readProcTCP() []connEntry {
 	localIPs := getLocalIPs()
 	var result []connEntry
-
 	for _, proto := range []string{"tcp", "tcp6"} {
 		data, err := os.ReadFile("/proc/net/" + proto)
 		if err != nil {
@@ -406,7 +485,6 @@ func readProcTCP() []connEntry {
 		isIPv6 := proto == "tcp6"
 		lines := strings.Split(string(data), "\n")
 
-		// Pass 1: 收集监听端口 + 所有非 LISTEN/SYN_SENT 连接
 		listenPorts := make(map[string]bool)
 		type raw struct {
 			rip, rport, lport string
@@ -441,12 +519,11 @@ func readProcTCP() []connEntry {
 				continue
 			}
 			if state == "02" {
-				continue // SYN_SENT = 出站
+				continue
 			}
 			conns = append(conns, raw{rip, rport, lport})
 		}
 
-		// Pass 2: 筛选入站
 		for _, c := range conns {
 			if localIPs[c.rip] {
 				continue
@@ -462,7 +539,6 @@ func readProcTCP() []connEntry {
 	return result
 }
 
-// readNfConntrack 从 /proc/net/nf_conntrack 读取入站连接 (TCP + UDP)
 func readNfConntrack() []connEntry {
 	data, err := os.ReadFile("/proc/net/nf_conntrack")
 	if err != nil {
@@ -493,7 +569,6 @@ func readNfConntrack() []connEntry {
 			continue
 		}
 
-		// 跳过 SYN_SENT (出站)
 		skip := false
 		for _, f := range fields {
 			if f == "SYN_SENT" {
@@ -505,7 +580,6 @@ func readNfConntrack() []connEntry {
 			continue
 		}
 
-		// 解析原始方向: 第一个 src/sport/dport
 		srcSeen := 0
 		var srcIP, srcPort, dstPort string
 		for _, f := range fields {
@@ -558,8 +632,6 @@ func deduplicateEntries(entries []connEntry) []connEntry {
 	return out
 }
 
-// getCurrentInbound 获取当前所有入站连接
-// 优先 nf_conntrack (TCP+UDP)，回退 /proc/net/tcp (仅TCP)
 func getCurrentInbound() []connEntry {
 	entries := readNfConntrack()
 	if len(entries) > 0 {
@@ -604,18 +676,16 @@ func appendToLog(entries []connEntry) {
 	defer f.Close()
 	ts := time.Now().Format("2006-01-02T15:04:05-0700")
 	for _, e := range entries {
-		fmt.Fprintf(f, "%s %s SRC=%s SPT=%s DPT=%s PROTO=%s\n",
-			ts, logPrefix, e.RemoteIP, e.RemotePort, e.LocalPort, e.Protocol)
+		fmt.Fprintf(f, "%s THROTTLE_IN SRC=%s SPT=%s DPT=%s PROTO=%s\n",
+			ts, e.RemoteIP, e.RemotePort, e.LocalPort, e.Protocol)
 	}
 }
 
-// doScanInbound CLI 子命令，由 cron 每分钟调用
 func doScanInbound() {
 	current := getCurrentInbound()
 	last := loadState()
 
 	if last == nil {
-		// 首次运行：建立基线，不记录
 		saveState(current)
 		return
 	}
@@ -723,14 +793,12 @@ func doAutoCleanup() {
 		} else {
 			os.WriteFile(logFilePath, []byte(joined+"\n"), 0640)
 		}
-		fmt.Printf("[自动清理] 已删除 %d 条超过 %d 天的记录 (剩余 %d 条)\n", removed, retentionDays, len(kept))
 	}
 	// 安全阀: 超过 100MB 截断
 	if info, err := os.Stat(logFilePath); err == nil && info.Size() > 100*1024*1024 {
 		if len(kept) > 10000 {
 			kept = kept[len(kept)-10000:]
 			os.WriteFile(logFilePath, []byte(strings.Join(kept, "\n")+"\n"), 0640)
-			fmt.Println("[自动清理] 日志超过 100MB，已截断至最近 10000 条")
 		}
 	}
 }
@@ -754,7 +822,7 @@ func writeLogrotateConfig() {
 
 func doInboundSetup() {
 	fmt.Println("\n========== 开启入站监控 ==========\n")
-	fmt.Println("基于 /proc 采集入站连接，无需安装额外软件包。")
+	fmt.Println("基于 /proc 采集入站 TCP 连接，无需安装额外软件包。")
 	fmt.Printf("日志保留: %d 天，超期自动清理\n\n", retentionDays)
 
 	if isMonitorActive() {
@@ -777,7 +845,6 @@ func doInboundSetup() {
 	}
 	fmt.Println("  → 已写入 logrotate 配置")
 
-	// 首次扫描建立基线
 	doScanInbound()
 
 	fmt.Println("\n✓ 入站监控已开启")
@@ -855,7 +922,7 @@ func parseField(line, key string) string {
 }
 
 func parseLogLine(line string) *InboundRecord {
-	if !strings.Contains(line, logPrefix) {
+	if !strings.Contains(line, "THROTTLE_IN") {
 		return nil
 	}
 	t, ok := parseLogTimestamp(line)
@@ -954,9 +1021,9 @@ func doInbound24h() {
 	}
 	summaries := aggregateIPs(records)
 	fmt.Printf("入站IP统计 (最近24小时)  总记录: %d 条  |  独立IP: %d 个\n", len(records), len(summaries))
-	fmt.Println("──────────────────────────────────────────────────────────────────────────")
+	fmt.Println("──────────────────────────────────────────────────────────────────────────────")
 	fmt.Printf("  %-18s %8s  %-24s %s\n", "IP地址", "次数", "目标端口", "最后出现")
-	fmt.Println("  ──────────────────────────────────────────────────────────────────────")
+	fmt.Println("  ─────────────────────────────────────────────────────────────────────────────")
 	limit := 50
 	if len(summaries) < limit {
 		limit = len(summaries)
@@ -970,8 +1037,9 @@ func doInbound24h() {
 		fmt.Printf("\n  ... 还有 %d 个IP未显示\n", len(summaries)-50)
 	}
 	fmt.Printf("\n最近连接详情 (最多50条):\n")
+	fmt.Println("──────────────────────────────────────────────────────────────────────────────")
 	fmt.Printf("  %-14s %-18s %-8s → %-8s %s\n", "时间", "源IP", "源端口", "目标端口", "协议")
-	fmt.Println("  ──────────────────────────────────────────────────────────────────────")
+	fmt.Println("  ─────────────────────────────────────────────────────────────────────────────")
 	dl := 50
 	if len(records) < dl {
 		dl = len(records)
@@ -997,9 +1065,9 @@ func doInbound7d() {
 	}
 	summaries := aggregateIPs(records)
 	fmt.Printf("入站IP统计 (最近7天)  总记录: %d 条  |  独立IP: %d 个\n", len(records), len(summaries))
-	fmt.Println("──────────────────────────────────────────────────────────────────────────")
+	fmt.Println("──────────────────────────────────────────────────────────────────────────────")
 	fmt.Printf("  %-18s %8s  %-24s %s\n", "IP地址", "次数", "目标端口", "最后出现")
-	fmt.Println("  ──────────────────────────────────────────────────────────────────────")
+	fmt.Println("  ─────────────────────────────────────────────────────────────────────────────")
 	limit := 100
 	if len(summaries) < limit {
 		limit = len(summaries)
@@ -1036,15 +1104,15 @@ func doInboundCount() {
 	}
 	sort.Strings(days)
 	fmt.Println("每日入站连接统计 (最近7天)")
-	fmt.Println("════════════════════════════════════════")
+	fmt.Println("══════════════════════════════════════════════")
 	fmt.Printf("  %-14s %12s\n", "日期", "连接数")
-	fmt.Println("  ──────────────────────────────────────")
+	fmt.Println("  ───────────────────────────────────────────")
 	total := 0
 	for _, d := range days {
 		fmt.Printf("  %-14s %12d\n", d, dayMap[d])
 		total += dayMap[d]
 	}
-	fmt.Println("  ──────────────────────────────────────")
+	fmt.Println("  ───────────────────────────────────────────")
 	fmt.Printf("  %-14s %12d\n", "总计", total)
 
 	summaries := aggregateIPs(records)
@@ -1126,46 +1194,58 @@ func showMenu() {
 	cfg := loadConfig()
 	init := detectInit()
 	monitorActive := isMonitorActive()
+	autostart := isAutostartEnabled()
 
-	fmt.Println("╔═══════════════════════════════════════════════╗")
-	fmt.Println("║              网络限速工具 v1.3                ║")
-	fmt.Println("╠═══════════════════════════════════════════════╣")
+	fmt.Println()
+	fmt.Println("  网络限速工具 v1.4")
+	fmt.Println()
+
+	// 当前状态
 	for _, dev := range cfg.Devices {
 		burst := calcBurst(dev)
-		auto := burst == dev.LimitMbps*6250/50
-		if auto {
-			fmt.Printf("║  限速: %-10s %3d Mbps  自动突发          ║\n", dev.Interface, dev.LimitMbps)
+		if dev.BurstKB > 0 {
+			fmt.Printf("  限速: %-10s %3d Mbps  %d KB\n", dev.Interface, dev.LimitMbps, burst)
 		} else {
-			fmt.Printf("║  限速: %-10s %3d Mbps  %4d KB            ║\n", dev.Interface, dev.LimitMbps, burst)
+			fmt.Printf("  限速: %-10s %3d Mbps  自动突发\n", dev.Interface, dev.LimitMbps)
 		}
 	}
-	monitorStr := "未启用"
+
 	if monitorActive {
-		monitorStr = fmt.Sprintf("监控中 (保留%d天)", retentionDays)
+		fmt.Printf("  监控: 已启用 (保留%d天)\n", retentionDays)
+	} else {
+		fmt.Println("  监控: 未启用")
 	}
-	fmt.Printf("║  监控: %-38s  ║\n", monitorStr)
-	fmt.Println("╠═══════════════════════════════════════════════╣")
-	fmt.Println("║  1.  apply          应用限速                 ║")
-	fmt.Println("║  2.  remove         移除限速                 ║")
-	fmt.Println("║  3.  status         查看当前规则             ║")
-	fmt.Println("║  4.  interfaces     查看网卡列表             ║")
-	fmt.Println("║  5.  setup          重新配置                 ║")
-	fmt.Println("║  6.  enable         开机自启                 ║")
-	fmt.Println("║  7.  disable        取消自启                 ║")
-	fmt.Println("║  ─────────────────────────────────────────── ║")
-	fmt.Println("║  8.  inbound setup  开启入站监控             ║")
-	fmt.Println("║  9.  inbound stop   关闭入站监控             ║")
-	fmt.Println("║  10. inbound 24h    24小时入站IP详情         ║")
-	fmt.Println("║  11. inbound 7d     7天入站IP列表            ║")
-	fmt.Println("║  12. inbound count  7天入站数量统计          ║")
-	fmt.Println("║  ─────────────────────────────────────────── ║")
-	fmt.Println("║  13. upgrade        升级程序                 ║")
-	fmt.Println("║  0.  exit           退出                     ║")
-	fmt.Printf("╚═══════════════════════════════════════════════╝\n")
-	fmt.Printf("  init: %s\n", init)
+
+	if autostart {
+		fmt.Printf("  自启: 已启用 (%s)\n", init)
+	} else {
+		fmt.Printf("  自启: 未启用\n")
+	}
+
+	// 功能菜单
+	fmt.Println()
+	fmt.Println("──────────────────────────────────────────────")
+	fmt.Println("  1.  apply          应用限速")
+	fmt.Println("  2.  remove         移除限速")
+	fmt.Println("  3.  status         查看当前规则")
+	fmt.Println("  4.  interfaces     查看网卡列表")
+	fmt.Println("  5.  setup          重新配置")
+	fmt.Println("  6.  enable         开机自启")
+	fmt.Println("  7.  disable        取消自启")
+	fmt.Println("──────────────────────────────────────────────")
+	fmt.Println("  8.  inbound setup  开启入站监控")
+	fmt.Println("  9.  inbound stop   关闭入站监控")
+	fmt.Println("  10. inbound 24h    24小时入站IP详情")
+	fmt.Println("  11. inbound 7d     7天入站IP列表")
+	fmt.Println("  12. inbound count  7天入站数量统计")
+	fmt.Println("──────────────────────────────────────────────")
+	fmt.Println("  13. upgrade        升级程序")
+	fmt.Println("  0.  exit           退出")
+	fmt.Println("──────────────────────────────────────────────")
 }
 
 func main() {
+	// CLI 模式
 	if len(os.Args) > 1 {
 		cfg := loadConfig()
 		switch os.Args[1] {
@@ -1186,14 +1266,20 @@ func main() {
 		return
 	}
 
+	// 交互模式: 升级检测 + 配置确认
+	checkUpgrade()
+
+	// 启动时自动清理过期日志
 	doAutoCleanup()
 
 	for {
 		clearScreen()
 		showMenu()
+
 		fmt.Print("\n请输入命令编号: ")
 		input, _ := reader.ReadString('\n')
 		input = strings.TrimSpace(input)
+
 		cfg := loadConfig()
 
 		switch input {
@@ -1229,6 +1315,7 @@ func main() {
 		default:
 			fmt.Println("无效输入，请重新选择")
 		}
+
 		fmt.Print("\n按回车返回菜单...")
 		reader.ReadString('\n')
 	}
