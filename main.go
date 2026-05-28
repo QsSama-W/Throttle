@@ -187,7 +187,7 @@ func checkUpgrade() {
 	_, configErr := os.Stat(configPath)
 
 	if os.IsNotExist(configErr) {
-		// 首次安装，无配置
+		// 无配置文件：首次安装
 		fmt.Println("\n首次运行，请配置限速参数。")
 		doSetup()
 		os.MkdirAll(stateDir, 0755)
@@ -195,17 +195,17 @@ func checkUpgrade() {
 		return
 	}
 
-	// 配置存在，检查是否升级
+	// 有配置文件：脚本已写好 或 正常运行
+	os.MkdirAll(stateDir, 0755)
+
+	// 无标记文件：创建标记，直接使用现有配置
 	_, markerErr := os.Stat(markerFile)
 	if os.IsNotExist(markerErr) {
-		// 有配置但无标记文件（旧版本安装 / 首次使用新版本）
-		promptExistingConfig()
-		os.MkdirAll(stateDir, 0755)
 		os.WriteFile(markerFile, []byte(time.Now().Format(time.RFC3339)), 0644)
 		return
 	}
 
-	// 标记文件存在，对比二进制修改时间
+	// 有标记文件：检测是否覆盖升级（二进制比标记文件新）
 	exe, exeErr := os.Executable()
 	if exeErr != nil {
 		return
@@ -219,6 +219,7 @@ func checkUpgrade() {
 		return
 	}
 	if exeInfo.ModTime().After(markerInfo.ModTime()) {
+		// 覆盖升级：二进制文件比标记新，询问是否保留配置
 		promptExistingConfig()
 		os.WriteFile(markerFile, []byte(time.Now().Format(time.RFC3339)), 0644)
 	}
