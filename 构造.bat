@@ -11,3 +11,5 @@ go build -o throttle-linux-arm64 .
 :: 清除，恢复默认
 set GOOS=
 set GOARCH=
+
+pause
